@@ -1,7 +1,9 @@
 # utp_tracer.py
 # Author: Ondřej Ondryáš (xondry02@stud.fit.vut.cz)
+# ---
+# Adapted from original code by Mostafa Razavi
+# Original source: https://github.com/elektito/bttools/blob/master/utptrace.py
 
-# suppress scapy warnings
 import logging
 import sys
 from serial import SerialNumber
@@ -10,8 +12,9 @@ import scapy.data
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, UDP
 
+from tcp_tracer import TcpFlow
+
 scapy.data.MTU = 65536
-logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
 ST_DATA = 0x0
 ST_FIN = 0x1
@@ -35,21 +38,15 @@ CS_PENDING_CLOSE = 12
 state_machine = {}
 
 
-class UtpFlow(object):
+class UtpFlow(TcpFlow):
     def __init__(self,
                  initiator_ip, initiator_port,
                  accepter_ip, accepter_port,
                  connid, seq0):
-        self.initiator_ip = initiator_ip
-        self.initiator_port = initiator_port
-        self.accepter_ip = accepter_ip
-        self.accepter_port = accepter_port
-        self.tup = (initiator_ip, initiator_port, accepter_ip, accepter_port, connid)
+        super().__init__(initiator_ip, initiator_port, accepter_ip, accepter_port, seq0)
         self.connid = connid
-        self.seq0 = seq0
-        self.seq1 = 0
         self.state = CS_HANDSHAKE
-        self.pending = []
+        self.tup = (initiator_ip, initiator_port, accepter_ip, accepter_port, 'utp')
 
     def __repr__(self):
         return '<UtpFlow {}>'.format(str(self))
@@ -130,7 +127,6 @@ class UtpTracer(object):
     def __init__(self, new_flow_cb, new_segment_cb, close_flow_cb):
         self.flows = {}
         self.logger = logging.getLogger('utptrace')
-        self.logger.setLevel(logging.WARNING)
         handler = logging.StreamHandler(sys.stdout)
         self.logger.addHandler(handler)
 
@@ -167,7 +163,7 @@ class UtpTracer(object):
             self.logger.debug('Duplicate SYN.')
             return
 
-        self.logger.warning(
+        self.logger.info(
             'Two peers trying simultaneously to initiate a connection. '
             'Letting the second one win.')
         self.flush_and_close(flow)
@@ -380,10 +376,10 @@ class UtpTracer(object):
         seq = SerialNumber(seq, 16)
 
         flow = self.flows.get((src, sport, dst, dport, connid if type == ST_SYN else connid - 1), None)
-        if not flow:
+        if flow is None:
             flow = self.flows.get((dst, dport, src, sport, connid), None)
 
-        if flow:
+        if flow is not None:
             s, t, e = flow.state, type, True
         else:
             s, t, e = CS_INIT, type, False
