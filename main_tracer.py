@@ -59,15 +59,7 @@ class DHTNode:
         self.node_id = node_id
         self.ip = ip
         self.port = port
-        self.known_nodes = {}
         self.known_peers = {}
-
-    def add_known_nodes(self, info_hash, nodes):
-        if info_hash not in self.known_nodes:
-            self.known_nodes[info_hash] = []
-
-        for node in nodes:
-            self.known_nodes[info_hash].append(node)
 
     def add_known_peer(self, info_hash, peer):
         if info_hash not in self.known_peers:
@@ -222,8 +214,6 @@ class Monitor:
 
         elif payload_len >= 98 and payload[8:12] == b'\x00\x00\x00\x01':
             # possible announce request
-            print("UDPTP ANNOUNCE?!")
-
             if packet[IP].dst not in self.udptp_known_ips:
                 return False
 
@@ -484,8 +474,8 @@ class Monitor:
                                f"and {flow.accepter_ip} before closing the old one")
             self.btp_parsers.pop(flow.tup)
 
-        self.btp_parsers[flow.tup] = (BitTorrentParser(self, flow.accepter_ip, flow.accepter_port),
-                                      BitTorrentParser(self, flow.initiator_ip, flow.initiator_port))
+        self.btp_parsers[flow.tup] = (BitTorrentParser(self, flow.initiator_ip, flow.initiator_port),
+                                      BitTorrentParser(self, flow.accepter_ip, flow.accepter_port))
 
     def on_new_segment(self, flow: TcpFlow, direction: int, payload):
         if flow.tup not in self.btp_parsers:
@@ -594,11 +584,11 @@ class OutputManager(object):
 
             dht_node_id = peer.own_dht_node.node_id.hex() \
                 if peer.own_dht_node is not None and peer.own_dht_node.node_id is not None \
-                else 'unknown'
+                else 'node ID unknown'
 
             pex = "\t[PEX]" if peer.pex else ""
 
-            print(f"{peer.ip}\t{peer.port}\t{peer.peer_id.hex() if peer.peer_id is not None else 'unknown'}\t"
+            print(f"{peer.ip}\t{peer.port}\t{peer.peer_id.hex() if peer.peer_id is not None else 'peed ID unknown'}\t"
                   f"{dht_node_id}{pex}")
 
             if len(peer.from_dht_nodes) > 0:
@@ -624,15 +614,11 @@ class OutputManager(object):
     @staticmethod
     def report_node(node: DHTNode, prefix="", full=False):
         print(f"{prefix}{node.ip}\t{node.port}\t{node.node_id.hex() if node.node_id is not None else 'unknown'}")
-        if full:
-            if len(node.known_peers) > 0:
-                print(f"{prefix}> Known peers:")
-                for peer in node.known_peers:
+        if full and len(node.known_peers) > 0:
+            print(f"{prefix}> Known peers:")
+            for peer_list in node.known_peers.values():
+                for peer in peer_list:
                     print(f"{prefix}>> {peer.ip}:{peer.port}")
-            if len(node.known_peers) > 0:
-                print(f"{prefix}> Known nodes:")
-                for node in node.known_nodes:
-                    print(f"{prefix}>> {node.ip}:{node.port} {node.node_id.hex() if node.node_id is not None else ''}")
 
     def report_all_bootstrap_nodes(self):
         print("=== BOOTSTRAP NODES ===")
