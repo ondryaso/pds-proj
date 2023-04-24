@@ -17,17 +17,15 @@ if __name__ == '__main__':
         m = main_tracer.Monitor(args.bootstrap_cutoff)
 
         m.out.show_errors = args.ve
-        m.out.show_errors = args.vi
         m.out.show_init = args.init
         m.out.show_peers = args.peers
         m.out.show_nodes = args.nodes
         m.out.show_download = args.download
         m.out.all_peers = args.vp
+        m.out.find_hostnames = args.bh
 
         print("dejte si kávičku, za chvíli jsem hotová\n")
-        # m.trace_udp_pcapng(args.pcap)
-        m.trace_pcapng("/home/ondryaso/Projects/02/pds-proj/05 arch down 1.pcapng")
-#        m.trace_pcapng("/home/ondryaso/Projects/02/pds-proj/10 local 2 ipv4.pcapng")
+        m.trace_pcapng(args.pcap)
         m.out.print_final_report()
 
 
@@ -44,13 +42,13 @@ if __name__ == '__main__':
         parser.add_argument("-nodes", action="store_true", help="list contacted DHT nodes")
         parser.add_argument("-download", action="store_true", help="list detected file transfers")
         parser.add_argument("-ve", action="store_true", help="verbose: print detection errors")
-        parser.add_argument("-vi", action="store_true", help="verbose: output intermediary results")
         parser.add_argument("-bootstrap-cutoff", metavar="<# of packets>", type=int, required=False,
                             help="the maximum number of UDP packets received between what's considered "
                                  "as bootstrap node requests. Set to zero to only show nodes the IPs of "
                                  "which have been resolved in DNS queries", default=20)
         parser.add_argument("-vp", action="store_true", help="verbose: print all peers, even if they didn't transmit"
                                                              "any pieces")
+        parser.add_argument("-bh", action="store_true", help="find hostname for bootstrap nodes")
 
         args = parser.parse_args()
 

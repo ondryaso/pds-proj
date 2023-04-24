@@ -103,6 +103,15 @@ class BitTorrentParser(object):
                 self.monitor.peer_dicts[self.current_infohash][(self.ip, self.port)].sent_pieces += 1
             except KeyError:
                 print("ASDasjhldaskhbjdsakjadwsgvhbs")
+        elif msg_type == "bitfield":
+            bits = len(bitfield) * 8
+            if self.current_infohash in self.monitor.torrents:
+                torrent = self.monitor.torrents[self.current_infohash]
+                torrent.set_number_of_pieces(bits)
+        elif begin is not None and length is not None:
+            if self.current_infohash in self.monitor.torrents:
+                torrent = self.monitor.torrents[self.current_infohash]
+                torrent.piece_info(begin, length)
 
     def new_extended_message(self, extension_name: str, **kwargs):
         if extension_name == 'ut_pex':
@@ -310,9 +319,6 @@ class BitTorrentParser(object):
 
     @register_message(5)
     def parse_message_bitfield(self, stream, length):
-        # bitfield = stream
-        # bitfield_str = ''.join(bin(i)[2:] for i in stream)
-        # self.logger.info('[MESSAGE] BITFIELD: {}'.format(bitfield_str))
         self.__new_message('bitfield', bitfield=stream)
 
     @register_message(6)

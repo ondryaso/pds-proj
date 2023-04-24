@@ -36,13 +36,23 @@ class Peer:
         self.pex = False
         self.sent_pieces = 0
 
+
 class TorrentInfo:
     def __init__(self, info_hash):
         self.info_hash = info_hash
-        self.bitfield_len = -1
+        self.pieces = -1
+        self.max_piece_len = -1
 
-    def set_bitfield_length(self, len):
-        self.bitfield_len = len
+    def set_number_of_pieces(self, bitfield_len):
+        if bitfield_len > self.pieces:
+            self.pieces = bitfield_len
+
+    def piece_info(self, offset, data_len):
+        possible_max = offset + data_len
+        if possible_max > self.max_piece_len:
+            # closest power of two
+            self.max_piece_len = 1 if possible_max == 0 else 2 ** (possible_max - 1).bit_length()
+
 
 class DHTNode:
     def __init__(self, node_id, ip, port):
@@ -93,13 +103,14 @@ class Monitor:
         self.peers_by_ips: Dict[Tuple[str, int], List[Peer]] = {}
         """Mappings of an (IP, port) tuple to a list of Peer objects with this contact information (each torrent gets
            its own Peer object)."""
+        self.torrents: Dict[bytes, TorrentInfo] = {}
+        """Mappings of an info-hash to a TorrentInfo object."""
 
         self.dht_bootstrap_nodes: List[DHTNode] = []
         """DHT nodes that haven't been discovered from another known DHT node."""
         self.last_bootstrap_upn = -1
         """The UDP datagram counter value for the last discovery of a bootstrap node."""
 
-        # self.dht_nodes = []
         self.dht_nodes_by_ips: Dict[Tuple[str, int], DHTNode] = {}
         """Mappings of an (IP, port) tuple to a single DHT node object."""
 
@@ -179,6 +190,7 @@ class Monitor:
             return
 
     def trace_tcp(self, packet):
+        # TODO: HTTP trackers
         self.tcp_tracer.trace(packet)
 
     @staticmethod
@@ -194,20 +206,24 @@ class Monitor:
 
     def trace_udp_tracker_proto(self, packet, payload):
         payload_len = len(payload)
-        contact = (packet[IP].src, packet[UDP].sport, 'udp')
 
-        if payload_len == 16 and payload[0:12] == b'\x00\x00\x04\x17\x27\x10\x19\x80\x00\x00\x00\x00':
+        if payload_len >= 16 and payload[0:12] == b'\x00\x00\x04\x17\x27\x10\x19\x80\x00\x00\x00\x00':
             # almost certainly connect request
             self.udptp_known_ips.append(packet[IP].dst)
             return True
-        elif payload_len == 16 and payload[0:4] == b'\x00':
+        elif payload_len >= 16 and payload[0:4] == b'\x00\x00\x00\x00':
             # probably connect response
             if packet[IP].src not in self.udptp_known_ips:
                 return False
+
+            contact = (packet[IP].src, packet[UDP].sport, 'udp')
             if contact not in self.trackers:
                 self.trackers[contact] = Tracker(contact[0], contact[1], contact[2])
-        elif payload_len == 98 and payload[8:12] == b'\x01':
+
+        elif payload_len >= 98 and payload[8:12] == b'\x00\x00\x00\x01':
             # possible announce request
+            print("UDPTP ANNOUNCE?!")
+
             if packet[IP].dst not in self.udptp_known_ips:
                 return False
 
@@ -217,10 +233,14 @@ class Monitor:
                 self.out.log_udptp_format_error()
                 return False
 
-            self.udptp_known_trans_ids[tid] = info_hash
+            contact = (packet[IP].dst, packet[UDP].dport, 'udp')
+            if contact not in self.trackers:
+                return False
+
             tracker = self.trackers[contact]
+            self.udptp_known_trans_ids[tid] = info_hash
             return self.make_peer_from_udp_announce_req(packet, payload, tracker)
-        elif payload_len >= 20 and payload[0:4] == b'\x01':
+        elif payload_len >= 20 and payload[0:4] == b'\x00\x00\x00\x01':
             # possible announce response
             if packet[IP].src not in self.udptp_known_ips:
                 return False
@@ -233,8 +253,13 @@ class Monitor:
             if tid not in self.udptp_known_trans_ids:
                 return False
 
+            contact = (packet[IP].src, packet[UDP].sport, 'udp')
+            if contact not in self.trackers:
+                return False
+
             info_hash = self.udptp_known_trans_ids.pop(tid)
             tracker = self.trackers[contact]
+
             self.make_peer_from_udp_announce_resp(payload, info_hash, tracker)
             return True
 
@@ -317,8 +342,8 @@ class Monitor:
 
         if req_type == b'get_peers':
             if not had_contact and (self.last_bootstrap_upn == -1
-                                    or self.upn - self.bootstrap_delta_cutoff < self.last_bootstrap_upn)\
-                                    or (self.bootstrap_delta_cutoff == 0 and packet[IP].dst in self.dns_possible_dht):
+                                    or self.upn - self.bootstrap_delta_cutoff < self.last_bootstrap_upn) \
+                    or (self.bootstrap_delta_cutoff == 0 and packet[IP].dst in self.dns_possible_dht):
                 self.dht_bootstrap_nodes.append(node)
                 self.last_bootstrap_upn = self.upn
 
@@ -381,6 +406,7 @@ class Monitor:
 
         if info_hash not in self.peer_dicts:
             self.peer_dicts[info_hash] = {}
+            self.torrents[info_hash] = TorrentInfo(info_hash)
 
         contact = (ip, port)
         if contact in self.peer_dicts[info_hash]:
@@ -482,7 +508,8 @@ class OutputManager(object):
     def __init__(self, monitor: Monitor):
         self.monitor = monitor
         self.show_errors = True
-        self.show_intermediary = True
+        self.show_intermediary = False
+
         self.show_init = False
         self.show_peers = False
         self.show_nodes = False
@@ -497,18 +524,70 @@ class OutputManager(object):
         if self.show_peers:
             self.report_all_peers()
 
-        # TODO
+        if self.show_download:
+            self.report_all_downloads()
+
+        if self.show_nodes:
+            self.report_all_nodes()
+
+    def report_all_downloads(self):
+        print("=== DOWNLOADED TORRENTS ===")
+        for info_hash in self.monitor.torrents:
+            self.report_download(info_hash)
+
+    def report_download(self, info_hash: bytes):
+        if not self.has_peers(info_hash):
+            return
+
+        torrent = self.monitor.torrents[info_hash]
+        peers = self.monitor.peer_dicts[info_hash]
+        has_size = torrent.max_piece_len != -1 and torrent.pieces != -1
+
+        print(f"info_hash: {info_hash.hex()}")
+        print(f"# of pieces (approx.): {torrent.pieces if torrent.pieces != -1 else 'unknown'}")
+        print(f"size of piece (approx.): "
+              f"{torrent.max_piece_len // 1024 if torrent.max_piece_len != -1 else 'unknown'} KiB")
+        print(f"total size (approx.): {torrent.pieces * torrent.max_piece_len // 1024 if has_size else 'unknown'} KiB")
+        print(f"contributing peers:")
+
+        for peer in peers.values():
+            if peer.sent_pieces == 0 and not self.all_peers:
+                continue
+
+            if torrent.pieces != -1:
+                print(f"> {peer.ip}:{peer.port} (detected {peer.sent_pieces} pieces ~ "
+                      f"{100.0 * peer.sent_pieces / torrent.pieces:.2f} %)")
+            else:
+                print(f"> {peer.ip}:{peer.port}")
+
+        print("")
 
     def report_all_peers(self):
         print("=== PEERS ===")
         for info_hash in self.monitor.peer_dicts:
             self.report_peers(info_hash)
 
+    def has_peers(self, info_hash: bytes):
+        peers = self.monitor.peer_dicts[info_hash]
+
+        has_peer = False
+        for peer in peers.values():
+            if peer.sent_pieces == 0:
+                continue
+            has_peer = True
+            break
+
+        return has_peer
+
     def report_peers(self, info_hash: bytes):
+        if not self.has_peers(info_hash) and not self.all_peers:
+            return
+
+        peers = self.monitor.peer_dicts[info_hash]
+
         print(f"Peers for {info_hash.hex()}:")
         print("ip\tport\tpeer id\tDHT node id\tflags")
 
-        peers = self.monitor.peer_dicts[info_hash]
         for peer in peers.values():
             if peer.sent_pieces == 0 and not self.all_peers:
                 continue
@@ -517,8 +596,10 @@ class OutputManager(object):
                 if peer.own_dht_node is not None and peer.own_dht_node.node_id is not None \
                 else 'unknown'
 
+            pex = "\t[PEX]" if peer.pex else ""
+
             print(f"{peer.ip}\t{peer.port}\t{peer.peer_id.hex() if peer.peer_id is not None else 'unknown'}\t"
-                  f"{dht_node_id}")
+                  f"{dht_node_id}{pex}")
 
             if len(peer.from_dht_nodes) > 0:
                 for node in peer.from_dht_nodes:
@@ -535,14 +616,30 @@ class OutputManager(object):
     def report_tracker(tracker: Tracker, prefix=""):
         print(f"{prefix}{tracker.proto}://{tracker.ip}:{tracker.port}")
 
+    def report_all_nodes(self):
+        print("=== ALL NODES ===")
+        for node in self.monitor.dht_nodes_by_ips.values():
+            self.report_node(node, full=True)
+
     @staticmethod
-    def report_node(node: DHTNode, prefix=""):
+    def report_node(node: DHTNode, prefix="", full=False):
         print(f"{prefix}{node.ip}\t{node.port}\t{node.node_id.hex() if node.node_id is not None else 'unknown'}")
+        if full:
+            if len(node.known_peers) > 0:
+                print(f"{prefix}> Known peers:")
+                for peer in node.known_peers:
+                    print(f"{prefix}>> {peer.ip}:{peer.port}")
+            if len(node.known_peers) > 0:
+                print(f"{prefix}> Known nodes:")
+                for node in node.known_nodes:
+                    print(f"{prefix}>> {node.ip}:{node.port} {node.node_id.hex() if node.node_id is not None else ''}")
 
     def report_all_bootstrap_nodes(self):
         print("=== BOOTSTRAP NODES ===")
         for n in self.monitor.dht_bootstrap_nodes:
             self.report_bootstrap_node(n)
+
+        print("")
 
     def report_bootstrap_node(self, node: DHTNode, intermediary: bool = False):
         if intermediary and not self.show_intermediary:
