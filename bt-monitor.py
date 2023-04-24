@@ -16,8 +16,10 @@ from typing import *
 
 
 class Tracker:
-    def __init__(self, address):
-        self.address = address
+    def __init__(self, ip: str, port: int, proto: str):
+        self.ip = ip
+        self.port = port
+        self.proto = proto
 
 
 class Peer:
@@ -90,6 +92,10 @@ class Monitor:
         self.dht_nodes_by_ips: Dict[Tuple[str, int], DHTNode] = {}
         """Mappings of an (IP, port) tuple to a single DHT node object."""
 
+        self.udptp_known_ips = []
+        self.udptp_known_trans_ids = []
+        self.trackers: Dict[Tuple[str, int, str], Tracker] = {}
+
         self.out = OutputManager(self)
         """The output generator."""
 
@@ -134,19 +140,17 @@ class Monitor:
             self.trace_dht(packet, payload)
             return
 
-        # try interpreting as a uTP / BT Peer proto message
-        if self.is_possible_btp(payload):
-            self.trace_btp(payload)
-            return
-
         # may be a DNS request to a tracker
         if DNS in packet:
             self.trace_dns(packet)
             return
 
         # or it may be the UDP Tracker Protocol
-        if self.is_udp_tracker_proto(payload):
-            self.trace_udp_tracker_proto(payload)
+        if self.trace_udp_tracker_proto(packet, payload):
+            return
+
+            # otherwise try interpreting as a uTP / BT Peer proto message
+        self.trace_btp(payload)
 
     @staticmethod
     def is_possible_dht(payload):
@@ -162,8 +166,69 @@ class Monitor:
     def is_possible_btp(self, payload):
         return False
 
-    def is_udp_tracker_proto(self, payload):
-        return False
+    def trace_udp_tracker_proto(self, packet, payload):
+        payload_len = len(payload)
+        contact = (packet[IP].src, packet[UDP].sport, 'udp')
+
+        if payload_len == 16 and payload[0:12] == b'\x00\x00\x04\x17\x27\x10\x19\x80\x00\x00\x00\x00':
+            # almost certainly connect request
+            self.udptp_known_ips.append(packet[IP].dst)
+            return True
+        elif payload_len == 16 and payload[0:4] == b'\x00':
+            # probably connect response
+            if packet[IP].src not in self.udptp_known_ips:
+                return False
+            if contact not in self.trackers:
+                self.trackers[contact] = Tracker(contact[0], contact[1], contact[2])
+        elif payload_len == 98 and payload[8:12] == b'\x01':
+            # possible announce request
+            if packet[IP].dst not in self.udptp_known_ips:
+                return False
+
+            tid = payload[12:16]
+            if len(tid) == 0:
+                self.out.log_udptp_format_error()
+                return False
+
+            self.udptp_known_trans_ids.append(tid)
+            tracker = self.trackers[contact]
+            return self.make_peer_from_udp_announce_req(packet, payload, tracker)
+        elif payload_len >= 20 and payload[0:4] == b'\x01':
+            # possible announce response
+            if packet[IP].src not in self.udptp_known_ips:
+                return False
+
+            tid = payload[4:8]
+            if len(tid) == 0:
+                self.out.log_udptp_format_error()
+                return False
+
+            if tid not in self.udptp_known_trans_ids:
+                return False
+
+            self.udptp_known_trans_ids.remove(tid)
+            tracker = self.trackers[contact]
+            return self.make_peer_from_udp_announce_resp(packet, payload, tracker)
+
+    def make_peer_from_udp_announce_req(self, packet, payload, tracker):
+        info_hash = payload[16:36]
+        peer_id = payload[36:56]
+        port = payload[96:98]
+        if len(info_hash) == 0 or len(peer_id) == 0 or len(port) == 0:
+            self.out.log_udptp_format_error()
+            return False
+
+        ip = packet[IP].src
+        p = self.get_or_add_peer(info_hash, ip, struct.unpack('!H', port)[0], peer_id)
+        if tracker not in p.from_trackers:
+            p.from_trackers.append(tracker)
+
+        return True
+
+    def make_peer_from_udp_announce_resp(self, packet, payload, tracker):
+        num_items = (len(payload) - 20) // 6
+
+        return True
 
     def get_dht_flow(self, packet, trans_id):
         key_cand = (packet[IP].dst, packet[IP].src, packet[UDP].dport, packet[UDP].sport, trans_id)
@@ -238,12 +303,12 @@ class Monitor:
             req = self.get_dht_flow(packet, decoded[b't'])
 
             if req is None:
-                self.out.report_unsolicited_dht_response(node_id, packet[IP].src, packet[UDP].sport, decoded[b't'])
+                self.out.log_unsolicited_dht_response(node_id, packet[IP].src, packet[UDP].sport, decoded[b't'])
                 return
 
             node, i_hash = req
             if node.node_id is not None and node.node_id != node_id:
-                self.out.report_node_id_mismatch(node, node_id, packet[IP].src, packet[UDP].sport)
+                self.out.log_node_id_mismatch(node, node_id, packet[IP].src, packet[UDP].sport)
 
             node.node_id = node_id
 
@@ -311,21 +376,21 @@ class Monitor:
             block_start = i * 26
             block_end = block_start + 26
 
-            # Extract the 20-byte block and IPv4 address/port
+            # extract the 20B block and IPv4 address/port
             block = compact_node_list[block_start:block_start + 20]
             ip_port_bytes = compact_node_list[block_start + 20:block_end]
 
-            # Unpack the IPv4 address and port using the 'struct' module
+            # unpack the IPv4 address and port
             ip_bytes, port = struct.unpack('!4sH', ip_port_bytes)
-            ip_addr = '.'.join(str(b) for b in ip_bytes)
+            ip_addr = self.ip_to_str(ip_bytes)
 
             self.get_or_add_node(block, ip_addr, port)
 
     def extract_peers(self, info_hash, dht_node, peer_list):
         for peer_contact in peer_list:
-            # unpack the next 6 bytes into a tuple of 4-byte IP address and 2-byte port
+            # unpack the next 6 B into a tuple of 4B IP address and 2B port
             ip_bytes, port = struct.unpack('!4sH', peer_contact)
-            ip_addr = '.'.join(str(b) for b in ip_bytes)
+            ip_addr = self.ip_to_str(ip_bytes)
             p = self.get_or_add_peer(info_hash, ip_addr, port)
             if dht_node is not None:
                 dht_node.add_known_peer(info_hash, p)
@@ -344,8 +409,9 @@ class Monitor:
         if b'torrent' in name or b'tracker' in name:
             self.dns_possible_trackers[val] = name.decode()
 
-    def trace_udp_tracker_proto(self, payload):
-        pass
+    @staticmethod
+    def ip_to_str(ip_bytes):
+        return '.'.join(str(b) for b in ip_bytes)
 
 
 class OutputManager(object):
@@ -381,19 +447,25 @@ class OutputManager(object):
             f"\t{n['node_id'] if n['node_id'] is not None else OutputManager.no_node_id_msg}"
             f"\t{n['hostname_capture'] or '-'}\t{n['hostname_query'] or '-'}")
 
-    def report_unsolicited_dht_response(self, node_id: bytes, sip: str, sport: int, tid: bytes):
+    def log_unsolicited_dht_response(self, node_id: bytes, sip: str, sport: int, tid: bytes):
         if not self.show_errors:
             return
 
         sys.stderr.write(f"Unsolicited DHT response from {node_id.hex()} ({sip}:{sport}), transaction '{tid.hex()}',"
                          f" packet #{self.monitor.pn}\n")
 
-    def report_node_id_mismatch(self, node: DHTNode, new_node_id: bytes, sip: str, sport: int):
+    def log_node_id_mismatch(self, node: DHTNode, new_node_id: bytes, sip: str, sport: int):
         if not self.show_errors:
             return
 
         sys.stderr.write(f"Node ID mismatch for {sip}:{sport}, previously known as: {node.node_id.hex()},"
                          f" ({node.ip}:{node.port}), now known as: {new_node_id.hex()}, packet #{self.monitor.pn}\n")
+
+    def log_udptp_format_error(self):
+        if not self.show_errors:
+            return
+        # TODO
+        sys.stderr.write("Invalid UDP Tracker Proto message.\n")
 
     def _get_bootstrap_node(self, node: DHTNode):
         hostname_c = self.monitor.dns_possible_dht[node.ip][:-1] if node.ip in self.monitor.dns_possible_dht else None
