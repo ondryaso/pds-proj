@@ -102,7 +102,7 @@ class BitTorrentParser(object):
             try:
                 self.monitor.peer_dicts[self.current_infohash][(self.ip, self.port)].sent_pieces += 1
             except KeyError:
-                print("ASDasjhldaskhbjdsakjadwsgvhbs")
+                self.monitor.out.log_error("Piece infohash/peer not found")
         elif msg_type == "bitfield":
             bits = len(bitfield) * 8
             if self.current_infohash in self.monitor.torrents:
@@ -343,7 +343,7 @@ class BitTorrentParser(object):
         self.__new_message('piece', index=index, begin=begin, data=data)
 
     @register_message(8)
-    def parse_message_choke(self, stream, length):
+    def parse_message_cancel(self, stream, length):
         index, begin, length = struct.unpack('!3I', stream[0:12])
         self.logger.info(
             '[MESSAGE] CANCEL: index={} begin={} length={}'.format(

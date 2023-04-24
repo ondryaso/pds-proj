@@ -24,7 +24,7 @@ if __name__ == '__main__':
         m.out.all_peers = args.vp
         m.out.find_hostnames = args.bh
 
-        print("dejte si kávičku, za chvíli jsem hotová\n")
+        print("dejte si kávičku, za chvíli jsem hotov\n")
         m.trace_pcapng(args.pcap)
         m.out.print_final_report()
 
