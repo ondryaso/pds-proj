@@ -53,21 +53,25 @@ class DHTNode:
         if peer in self.known_peers[info_hash]:
             return
 
-        print(
-            f"adding peer for {info_hash.hex()}: {peer.ip}\t{peer.port}")
         self.known_peers[info_hash].append(peer)
         if self not in peer.from_dht_nodes:
             peer.from_dht_nodes.append(self)
 
 
 class Monitor:
+    BOOTSTRAP_DELTA_CUTOFF = 50
 
     def __init__(self):
+        self.upn = 0
+        """A counter for processed UDP datagrams."""
+        self.pn = 0
+        """A counter for all processed input packets."""
+
         self.dns_possible_dht: Dict[str, str] = {}
         """IP-hostname mappings for possible DHT nodes discovered from DNS queries"""
         self.dns_possible_trackers: Dict[str, str] = {}
         """IP-hostname mappings for possible trackers discovered from DNS queries"""
-        self.dht_transactions: Dict[Tuple[str, int, str, int, bytes], Tuple[DHTNode, str]] = {}
+        self.dht_transactions: Dict[Tuple[str, int, str, int, bytes], Tuple[DHTNode, bytes | None]] = {}
         """A temporary storage for IDs of discovered DHT requests"""
 
         self.peer_dicts: Dict[bytes, Dict[Tuple[str, int], Peer]] = {}
@@ -79,6 +83,9 @@ class Monitor:
 
         self.dht_bootstrap_nodes: List[DHTNode] = []
         """DHT nodes that haven't been discovered from another known DHT node."""
+        self.last_bootstrap_upn = -1
+        """The UDP datagram counter value for the last discovery of a bootstrap node."""
+
         # self.dht_nodes = []
         self.dht_nodes_by_ips: Dict[Tuple[str, int], DHTNode] = {}
         """Mappings of an (IP, port) tuple to a single DHT node object."""
@@ -93,6 +100,7 @@ class Monitor:
         fragments = []
 
         for pkt_data in reader:
+            self.pn += 1
             p = Ether(pkt_data[0])
 
             if not isinstance(p[1], IP):
@@ -115,6 +123,8 @@ class Monitor:
                 self.trace_udp(p)
 
     def trace_udp(self, packet):
+        self.upn += 1
+
         payload = bytes(packet[3])
         if len(payload) < 4:
             return
@@ -159,16 +169,16 @@ class Monitor:
         key_cand = (packet[IP].dst, packet[IP].src, packet[UDP].dport, packet[UDP].sport, trans_id)
         if key_cand in self.dht_transactions:
             return self.dht_transactions.pop(key_cand)
-        key_cand = (packet[IP].src, packet[IP].dst, packet[UDP].sport, packet[UDP].dport, trans_id)
-        if key_cand in self.dht_transactions:
-            return self.dht_transactions.pop(key_cand)
+        # key_cand = (packet[IP].src, packet[IP].dst, packet[UDP].sport, packet[UDP].dport, trans_id)
+        # if key_cand in self.dht_transactions:
+        #     return self.dht_transactions.pop(key_cand)
 
         return None
 
     def set_dht_flow(self, packet, trans_id, val):
         key_cand = (packet[IP].src, packet[IP].dst, packet[UDP].sport, packet[UDP].dport, trans_id)
-        if key_cand not in self.dht_transactions:
-            key_cand = (packet[IP].dst, packet[IP].src, packet[UDP].dport, packet[UDP].sport, trans_id)
+        # if key_cand not in self.dht_transactions:
+        #     key_cand = (packet[IP].dst, packet[IP].src, packet[UDP].dport, packet[UDP].sport, trans_id)
 
         self.dht_transactions[key_cand] = val
 
@@ -196,18 +206,22 @@ class Monitor:
         req_type = decoded[b'q']
         args = decoded[b'a']
 
-        if b'info_hash' not in args:
+        node, had_contact = self.get_or_add_node(None, packet[IP].dst, packet[UDP].dport)
+        i_hash = args[b'info_hash'] if b'info_hash' in args else None
+
+        if b't' in decoded:
+            self.set_dht_flow(packet, decoded[b't'], (node, i_hash))
+
+        # ping messages
+        if i_hash is None:
             return
 
-        i_hash = args[b'info_hash']
-        node, had_contact = self.get_or_add_node(None, packet[IP].dst, packet[UDP].dport)
-
         if req_type == b'get_peers':
-            if b't' in decoded:
-                self.set_dht_flow(packet, decoded[b't'], (node, i_hash))
-            if not had_contact:
+            if not had_contact and (self.last_bootstrap_upn == -1
+                                    or self.upn - Monitor.BOOTSTRAP_DELTA_CUTOFF < self.last_bootstrap_upn):
                 self.dht_bootstrap_nodes.append(node)
-                #self.out.report_bootstrap_node(node)
+                self.out.report_bootstrap_node(node, True)
+                self.last_bootstrap_upn = self.upn
 
         elif req_type == b'announce_peer':
             p = self.get_or_add_peer(i_hash, packet[IP].src, packet[UDP].sport)
@@ -224,14 +238,19 @@ class Monitor:
             req = self.get_dht_flow(packet, decoded[b't'])
 
             if req is None:
-                print("unsolicited dht response")
+                self.out.report_unsolicited_dht_response(node_id, packet[IP].src, packet[UDP].sport, decoded[b't'])
                 return
 
             node, i_hash = req
             if node.node_id is not None and node.node_id != node_id:
-                print(f"node id mismatch, prev: {node.node_id.hex()}, now got in response: {node_id.hex()}")
+                self.out.report_node_id_mismatch(node, node_id, packet[IP].src, packet[UDP].sport)
 
             node.node_id = node_id
+
+            if i_hash is None:
+                # responses to ping messages
+                return
+
             if b'values' in resp:
                 self.extract_peers(i_hash, node, resp[b'values'])
 
@@ -330,18 +349,51 @@ class Monitor:
 
 
 class OutputManager(object):
-    no_node_id_msg = 'no response, node ID not known          '
+    no_node_id_msg = 'node ID unknown                         '
 
     def __init__(self, monitor: Monitor):
         self.monitor = monitor
+        self.show_errors = True
+        self.show_intermediary = True
+        self.show_init = False
+        self.show_peers = False
+        self.show_nodes = False
+        self.show_download = False
 
-    def report_bootstrap_node(self, node: DHTNode):
+    def print_final_report(self):
+        if self.show_init:
+            self.report_all_bootstrap_nodes()
+
+        # TODO
+
+    def report_all_bootstrap_nodes(self):
+        for n in self.monitor.dht_bootstrap_nodes:
+            self.report_bootstrap_node(n)
+
+    def report_bootstrap_node(self, node: DHTNode, intermediary: bool = False):
+        if intermediary and not self.show_intermediary:
+            return
+
         n = self._get_bootstrap_node(node)
-
         print(
+            f"{'[INTM. BOOTSTRAP N.] ' if intermediary else ''}"
             f"{n['ip']}\t{n['port']}"
             f"\t{n['node_id'] if n['node_id'] is not None else OutputManager.no_node_id_msg}"
             f"\t{n['hostname_capture'] or '-'}\t{n['hostname_query'] or '-'}")
+
+    def report_unsolicited_dht_response(self, node_id: bytes, sip: str, sport: int, tid: bytes):
+        if not self.show_errors:
+            return
+
+        sys.stderr.write(f"Unsolicited DHT response from {node_id.hex()} ({sip}:{sport}), transaction '{tid.hex()}',"
+                         f" packet #{self.monitor.pn}\n")
+
+    def report_node_id_mismatch(self, node: DHTNode, new_node_id: bytes, sip: str, sport: int):
+        if not self.show_errors:
+            return
+
+        sys.stderr.write(f"Node ID mismatch for {sip}:{sport}, previously known as: {node.node_id.hex()},"
+                         f" ({node.ip}:{node.port}), now known as: {new_node_id.hex()}, packet #{self.monitor.pn}\n")
 
     def _get_bootstrap_node(self, node: DHTNode):
         hostname_c = self.monitor.dns_possible_dht[node.ip][:-1] if node.ip in self.monitor.dns_possible_dht else None
@@ -356,11 +408,44 @@ class OutputManager(object):
 
 
 if __name__ == '__main__':
-    print("dejte si kávičku, za chvíli jsem hotová\n")
+    def main():
+        args = parse_args()
+        m = Monitor()
 
-    m = Monitor()
+        m.out.show_errors = args.ve
+        m.out.show_errors = args.vi
+        m.out.show_init = args.init
+        m.out.show_peers = args.peers
+        m.out.show_nodes = args.nodes
+        m.out.show_download = args.download
 
-    # m.trace_udp_pcapng("../01 first run.pcapng")
-    m.trace_udp_pcapng("../05 arch down 1.pcapng")
-    for n in m.dht_bootstrap_nodes:
-        m.out.report_bootstrap_node(n)
+        print("dejte si kávičku, za chvíli jsem hotová\n")
+        # m.trace_udp_pcapng(args.pcap)
+        m.trace_udp_pcapng("../01 first run.pcapng")
+        m.out.print_final_report()
+
+
+    def parse_args():
+        import argparse
+
+        parser = argparse.ArgumentParser(description="A simple BitTorrent communication detection tool.")
+
+        parser.add_argument("-pcap", metavar="<FILE>", type=str, required=True,
+                            help="the input pcap(ng) file")
+
+        parser.add_argument("-init", action="store_true", help="list detected bootstrap nodes")
+        parser.add_argument("-peers", action="store_true", help="list detected peer neighbors")
+        parser.add_argument("-nodes", action="store_true", help="list contacted DHT nodes")
+        parser.add_argument("-download", action="store_true", help="list detected file transfers")
+        parser.add_argument("-ve", action="store_true", help="verbose: print detection errors")
+        parser.add_argument("-vi", action="store_true", help="verbose: output intermediary results")
+
+        args = parser.parse_args()
+
+        if not any([args.init, args.peers, args.nodes, args.download]):
+            parser.error("At least one of -init, -peers, -nodes or -download must be used.")
+
+        return args
+
+
+    main()
