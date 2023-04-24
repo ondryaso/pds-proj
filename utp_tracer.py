@@ -130,7 +130,7 @@ class UtpTracer(object):
     def __init__(self, new_flow_cb, new_segment_cb, close_flow_cb):
         self.flows = {}
         self.logger = logging.getLogger('utptrace')
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.WARNING)
         handler = logging.StreamHandler(sys.stdout)
         self.logger.addHandler(handler)
 
@@ -152,7 +152,7 @@ class UtpTracer(object):
     @on_existing_flow(True)
     def action(self, flow, payload, src, sport, dst, dport, connid, seq):
         if (src, sport, dst, dport) == flow.tup[:-1]:
-            self.logger.warning('Expected SYN ACK. Ignored.')
+            # self.logger.warning('Expected SYN ACK. Ignored.')
             return
 
         flow.seq1 = seq
@@ -198,7 +198,8 @@ class UtpTracer(object):
             self.add_segment(flow, 1, payload, seq)
             flow.state = CS_CONNECTED
         else:
-            self.logger.warning('Something bad has happened!')
+            # self.logger.warning('Something bad has happened!')
+            pass
 
     @on_state(CS_CONNECTED)
     @on_packet_type(ST_STATE)
@@ -345,41 +346,37 @@ class UtpTracer(object):
                isinstance(pkt[1], IP) and \
                isinstance(pkt[2], UDP)
 
-        payload = str(pkt[3])
+        payload = bytes(pkt[3])
         if len(payload) < 20:
-            self.logger.debug('Payload smaller than 20 bytes. Not a uTP packet.')
             return
 
-        version = ord(payload[0]) & 0x0f
+        version = (payload[0]) & 0x0f
         if version != 1:
-            self.logger.debug('Invalid version. Not a uTP packet.')
             return
 
-        type = (ord(payload[0]) & 0xf0) >> 4
+        type = ((payload[0]) & 0xf0) >> 4
         if type > 4:
-            self.logger.debug('Invalid type. Not a uTP packet.')
             return
 
-        extension = ord(payload[1])
+        extension = (payload[1])
         ext_len = 0
         while extension != 0:
             if len(payload) < 20 + ext_len + 1:
-                self.logger.debug('Invalid packet length. Not a UTP packet.')
                 return
-            extension = ord(payload[20 + ext_len])
-            length = ord(payload[20 + ext_len + 1])
+            extension = (payload[20 + ext_len])
+            length = (payload[20 + ext_len + 1])
             ext_len += 2 + length
 
-        connid = (ord(payload[2]) << 8) | \
-                 (ord(payload[3]) << 0)
+        connid = ((payload[2]) << 8) | \
+                 ((payload[3]) << 0)
 
         src = pkt[1].src
         dst = pkt[1].dst
         sport = pkt[2].sport
         dport = pkt[2].dport
 
-        seq = (ord(payload[16]) << 8) | \
-              (ord(payload[17]) << 0)
+        seq = ((payload[16]) << 8) | \
+              ((payload[17]) << 0)
         seq = SerialNumber(seq, 16)
 
         flow = self.flows.get((src, sport, dst, dport, connid if type == ST_SYN else connid - 1), None)
@@ -409,13 +406,14 @@ class UtpTracer(object):
             else:
                 flow.seq1 += 1
 
-            self.logger.info('New segment arrived from the {}.'.format(
-                'initiator' if direction == 0 else 'accepter'))
+            # self.logger.info('New segment arrived from the {}.'.format(
+            #    'initiator' if direction == 0 else 'accepter'))
         elif seq > fseq:
             flow.pending.append((payload, seq, direction))
             self.logger.debug('Out of order packet. Added to pending list.')
         else:  # seq < fseq
             self.logger.debug('Duplicate packet. Ignored.')
+            pass
 
         added_some = True
         removed = []
@@ -426,14 +424,14 @@ class UtpTracer(object):
                 if direction == 0:
                     if seq == flow.seq0:
                         self.new_segment(flow, direction, payload)
-                        self.logger.info('Pending segment added: {} byte(s)'.format(len(payload)))
+                        # self.logger.info('Pending segment added: {} byte(s)'.format(len(payload)))
                         flow.seq0 += 1
                         added_some = True
                         removed.append((seq, direction))
                 else:
                     if seq == flow.seq1:
                         self.new_segment(flow, direction, payload)
-                        self.logger.info('Pending segment added: {} byte(s)'.format(len(payload)))
+                        # self.logger.info('Pending segment added: {} byte(s)'.format(len(payload)))
                         flow.seq1 += 1
                         added_some = True
                         removed.append((seq, direction))

@@ -14,6 +14,9 @@ from scapy.utils import RawPcapNgReader
 from bencoder import bdecode2, BTFailure
 from typing import *
 
+from btp_parser import BitTorrentParser
+from utp_tracer import UtpTracer, UtpFlow
+
 
 class Tracker:
     def __init__(self, ip: str, port: int, proto: str):
@@ -61,13 +64,13 @@ class DHTNode:
 
 
 class Monitor:
-    BOOTSTRAP_DELTA_CUTOFF = 50
-
-    def __init__(self):
+    def __init__(self, bootstrap_delta_cutoff: int):
         self.upn = 0
         """A counter for processed UDP datagrams."""
         self.pn = 0
         """A counter for all processed input packets."""
+        self.bootstrap_delta_cutoff = bootstrap_delta_cutoff
+        """Maximum number of received UDP packets between DHT bootstrap nodes' responses."""
 
         self.dns_possible_dht: Dict[str, str] = {}
         """IP-hostname mappings for possible DHT nodes discovered from DNS queries"""
@@ -92,9 +95,16 @@ class Monitor:
         self.dht_nodes_by_ips: Dict[Tuple[str, int], DHTNode] = {}
         """Mappings of an (IP, port) tuple to a single DHT node object."""
 
-        self.udptp_known_ips = []
-        self.udptp_known_trans_ids = []
+        self.udptp_known_ips: List[str] = []
+        """IPs of known UDP trackers"""
+        self.udptp_known_trans_ids: Dict[bytes, bytes] = {}
+        """Mappings of an UDP tracker transaction ID to an info hash."""
         self.trackers: Dict[Tuple[str, int, str], Tracker] = {}
+        """Mappings of an (IP, port, tracker proto) to a Tracker object."""
+
+        self.utp_tracer = UtpTracer(self.on_utp_new_flow, self.on_utp_new_segment, self.on_utp_close_flow)
+        """The uTorrent Transport Protocol tracer"""
+        self.btp_parsers: Dict[Any, Tuple[BitTorrentParser, BitTorrentParser]] = {}
 
         self.out = OutputManager(self)
         """The output generator."""
@@ -135,6 +145,11 @@ class Monitor:
         if len(payload) < 4:
             return
 
+        if packet[UDP].sport != 7654 and packet[UDP].dport != 7654:
+            return
+        # otherwise try interpreting as a uTP / BT Peer proto message
+        self.utp_tracer.trace(packet)
+
         # try interpreting as a DHT message
         if self.is_possible_dht(payload):
             self.trace_dht(packet, payload)
@@ -149,9 +164,6 @@ class Monitor:
         if self.trace_udp_tracker_proto(packet, payload):
             return
 
-            # otherwise try interpreting as a uTP / BT Peer proto message
-        self.trace_btp(payload)
-
     @staticmethod
     def is_possible_dht(payload):
         # dht packets are bencoded dicts, they must start with 'dX:' where X is a digit
@@ -162,9 +174,6 @@ class Monitor:
             return False
 
         return True
-
-    def is_possible_btp(self, payload):
-        return False
 
     def trace_udp_tracker_proto(self, packet, payload):
         payload_len = len(payload)
@@ -186,11 +195,12 @@ class Monitor:
                 return False
 
             tid = payload[12:16]
-            if len(tid) == 0:
+            info_hash = payload[16:36]
+            if len(tid) == 0 or len(info_hash) == 0:
                 self.out.log_udptp_format_error()
                 return False
 
-            self.udptp_known_trans_ids.append(tid)
+            self.udptp_known_trans_ids[tid] = info_hash
             tracker = self.trackers[contact]
             return self.make_peer_from_udp_announce_req(packet, payload, tracker)
         elif payload_len >= 20 and payload[0:4] == b'\x01':
@@ -206,9 +216,10 @@ class Monitor:
             if tid not in self.udptp_known_trans_ids:
                 return False
 
-            self.udptp_known_trans_ids.remove(tid)
+            info_hash = self.udptp_known_trans_ids.pop(tid)
             tracker = self.trackers[contact]
-            return self.make_peer_from_udp_announce_resp(packet, payload, tracker)
+            self.make_peer_from_udp_announce_resp(payload, info_hash, tracker)
+            return True
 
     def make_peer_from_udp_announce_req(self, packet, payload, tracker):
         info_hash = payload[16:36]
@@ -225,10 +236,16 @@ class Monitor:
 
         return True
 
-    def make_peer_from_udp_announce_resp(self, packet, payload, tracker):
+    def make_peer_from_udp_announce_resp(self, payload, info_hash, tracker):
         num_items = (len(payload) - 20) // 6
-
-        return True
+        for i in range(num_items):
+            peer_ip = payload[20 + i * 6:20 + i * 6 + 4]
+            port = payload[20 + i * 6 + 4:20 + i * 6 + 6]
+            if len(peer_ip) == 0 or len(port) == 0:
+                continue
+            p = self.get_or_add_peer(info_hash, self.ip_to_str(peer_ip), struct.unpack('!H', port)[0])
+            if tracker not in p.from_trackers:
+                p.from_trackers.append(tracker)
 
     def get_dht_flow(self, packet, trans_id):
         key_cand = (packet[IP].dst, packet[IP].src, packet[UDP].dport, packet[UDP].sport, trans_id)
@@ -283,7 +300,7 @@ class Monitor:
 
         if req_type == b'get_peers':
             if not had_contact and (self.last_bootstrap_upn == -1
-                                    or self.upn - Monitor.BOOTSTRAP_DELTA_CUTOFF < self.last_bootstrap_upn):
+                                    or self.upn - self.bootstrap_delta_cutoff < self.last_bootstrap_upn):
                 self.dht_bootstrap_nodes.append(node)
                 self.out.report_bootstrap_node(node, True)
                 self.last_bootstrap_upn = self.upn
@@ -395,9 +412,6 @@ class Monitor:
             if dht_node is not None:
                 dht_node.add_known_peer(info_hash, p)
 
-    def trace_btp(self, payload):
-        pass
-
     def trace_dns(self, packet):
         if DNSRR not in packet:
             return
@@ -408,6 +422,26 @@ class Monitor:
             self.dns_possible_dht[val] = name.decode()
         if b'torrent' in name or b'tracker' in name:
             self.dns_possible_trackers[val] = name.decode()
+
+    def on_utp_new_flow(self, flow: UtpFlow):
+        conn_id = flow.connid
+        if conn_id in self.btp_parsers:
+            print("wtf: parser already present")
+            return
+
+        self.btp_parsers[conn_id] = (BitTorrentParser(self), BitTorrentParser(self))
+
+    def on_utp_new_segment(self, flow: UtpFlow, direction: int, payload):
+        conn_id = flow.connid
+        if conn_id not in self.btp_parsers:
+            print("wtf: parser not present")
+            return
+
+        parser = self.btp_parsers[conn_id][direction]
+
+    def on_utp_close_flow(self, flow: UtpFlow):
+        print(f"id: {flow.connid} stop")
+        pass
 
     @staticmethod
     def ip_to_str(ip_bytes):
@@ -425,6 +459,7 @@ class OutputManager(object):
         self.show_peers = False
         self.show_nodes = False
         self.show_download = False
+        self.find_hostnames = False
 
     def print_final_report(self):
         if self.show_init:
@@ -469,10 +504,14 @@ class OutputManager(object):
 
     def _get_bootstrap_node(self, node: DHTNode):
         hostname_c = self.monitor.dns_possible_dht[node.ip][:-1] if node.ip in self.monitor.dns_possible_dht else None
-        try:
-            query = socket.gethostbyaddr(node.ip)
-            hostname_q = query[0] if query is not None and query[0] is not None else None
-        except socket.herror:
+
+        if self.find_hostnames:
+            try:
+                query = socket.gethostbyaddr(node.ip)
+                hostname_q = query[0] if query is not None and query[0] is not None else None
+            except socket.herror:
+                hostname_q = None
+        else:
             hostname_q = None
 
         return {'node_id': node.node_id.hex() if node.node_id is not None else None,
@@ -482,7 +521,7 @@ class OutputManager(object):
 if __name__ == '__main__':
     def main():
         args = parse_args()
-        m = Monitor()
+        m = Monitor(args.bootstrap_cutoff)
 
         m.out.show_errors = args.ve
         m.out.show_errors = args.vi
@@ -493,7 +532,7 @@ if __name__ == '__main__':
 
         print("dejte si kávičku, za chvíli jsem hotová\n")
         # m.trace_udp_pcapng(args.pcap)
-        m.trace_udp_pcapng("../01 first run.pcapng")
+        m.trace_udp_pcapng("C:\\Users\\ondry\\arch_utp.pcapng")
         m.out.print_final_report()
 
 
@@ -502,7 +541,7 @@ if __name__ == '__main__':
 
         parser = argparse.ArgumentParser(description="A simple BitTorrent communication detection tool.")
 
-        parser.add_argument("-pcap", metavar="<FILE>", type=str, required=True,
+        parser.add_argument("-pcap", metavar="<file>", type=str, required=True,
                             help="the input pcap(ng) file")
 
         parser.add_argument("-init", action="store_true", help="list detected bootstrap nodes")
@@ -511,6 +550,9 @@ if __name__ == '__main__':
         parser.add_argument("-download", action="store_true", help="list detected file transfers")
         parser.add_argument("-ve", action="store_true", help="verbose: print detection errors")
         parser.add_argument("-vi", action="store_true", help="verbose: output intermediary results")
+        parser.add_argument("-bootstrap-cutoff", metavar="<# of packets>", type=int, required=False,
+                            help="the maximum number of UDP packets received between what's considered "
+                                 "as bootstrap node requests", default=50)
 
         args = parser.parse_args()
 
